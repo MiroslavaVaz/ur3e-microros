@@ -22,6 +22,8 @@ setup(
         'console_scripts': [
             'button_input_node = ur3e_esp32_control.button_input_node:main',
             'joint_state_tracker = ur3e_esp32_control.joint_state_tracker:main',
+            'calc_ik_node = ur3e_esp32_control.calc_ik_node:main',
+            'instruction_node = ur3e_esp32_control.instruction_node:main',
         ],
     },
 )
