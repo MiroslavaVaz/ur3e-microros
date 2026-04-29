@@ -5,24 +5,22 @@ calc_ik_node.py
 Computes inverse kinematics for the UR3e robot given a target (x, y, z)
 position and publishes the required joint angles.
 
-This node is compatible with Gazebo and URSim simulations.
+Improvements over previous version:
+  - Seed is computed from target direction (points arm toward target)
+  - Joint angle minimization penalty keeps angles small and natural
+  - Multiple restarts pick the best solution found
 
 Subscriptions
   /ik_target  (geometry_msgs/Point)  — target position (x, y, z) in metres
 
 Publications
-  /ik_joint_state  (sensor_msgs/JointState)  — computed joint angles
-  /target_joint_state (sensor_msgs/JointState) — same, for instruction node
+  /ik_joint_state     (sensor_msgs/JointState)  — computed joint angles
+  /target_joint_state (sensor_msgs/JointState)  — same, for instruction node
 
 Parameters
-  initial_target_x  (float, default 0.3)   — x position of target
-  initial_target_y  (float, default 0.0)   — y position of target
-  initial_target_z  (float, default 0.3)   — z position of target
-
-Usage
-  # Set a target position via topic:
-  ros2 topic pub --once /ik_target geometry_msgs/msg/Point \
-      "{x: 0.3, y: 0.1, z: 0.3}"
+  initial_target_x  (float, default 0.3)
+  initial_target_y  (float, default 0.0)
+  initial_target_z  (float, default 0.3)
 """
 
 import math
@@ -34,15 +32,14 @@ from geometry_msgs.msg import Point
 from sensor_msgs.msg import JointState
 
 
-# UR3e DH parameters (metres and radians)
-# [a, d, alpha, theta_offset]
+# UR3e DH parameters [a, d, alpha, theta_offset]
 UR3E_DH = [
-    [0.0,      0.15185,  math.pi / 2,  0.0],   # Joint 1 shoulder_pan
-    [-0.24355, 0.0,      0.0,          0.0],   # Joint 2 shoulder_lift
-    [-0.2132,  0.0,      0.0,          0.0],   # Joint 3 elbow
-    [0.0,      0.13105,  math.pi / 2,  0.0],   # Joint 4 wrist_1
-    [0.0,      0.08535, -math.pi / 2,  0.0],   # Joint 5 wrist_2
-    [0.0,      0.0921,   0.0,          0.0],   # Joint 6 wrist_3
+    [0.0,      0.15185,  math.pi / 2,  0.0],
+    [-0.24355, 0.0,      0.0,          0.0],
+    [-0.2132,  0.0,      0.0,          0.0],
+    [0.0,      0.13105,  math.pi / 2,  0.0],
+    [0.0,      0.08535, -math.pi / 2,  0.0],
+    [0.0,      0.0921,   0.0,          0.0],
 ]
 
 JOINT_NAMES = [
@@ -56,7 +53,6 @@ JOINT_NAMES = [
 
 NUM_JOINTS = len(JOINT_NAMES)
 
-# UR3e joint limits (radians)
 JOINT_LIMITS = [
     (-2 * math.pi, 2 * math.pi),
     (-2 * math.pi, 2 * math.pi),
@@ -66,14 +62,21 @@ JOINT_LIMITS = [
     (-2 * math.pi, 2 * math.pi),
 ]
 
+# Preferred "neutral" angles — solver is penalized for deviating from these
+# This is a natural elbow-up forward-reach pose
+PREFERRED_ANGLES = [
+    0.0,            # shoulder_pan   — straight ahead
+    -math.pi / 4,   # shoulder_lift  — tilted forward slightly
+    math.pi / 2,    # elbow          — elbow up
+    -math.pi / 4,   # wrist_1        — level
+    -math.pi / 2,   # wrist_2        — neutral
+    0.0,            # wrist_3        — neutral
+]
 
-def dh_transform(a: float, d: float, alpha: float, theta: float) -> np.ndarray:
-    """Compute a single DH transformation matrix."""
-    ct = math.cos(theta)
-    st = math.sin(theta)
-    ca = math.cos(alpha)
-    sa = math.sin(alpha)
 
+def dh_transform(a, d, alpha, theta):
+    ct, st = math.cos(theta), math.sin(theta)
+    ca, sa = math.cos(alpha), math.sin(alpha)
     return np.array([
         [ct,  -st * ca,  st * sa,  a * ct],
         [st,   ct * ca, -ct * sa,  a * st],
@@ -82,119 +85,126 @@ def dh_transform(a: float, d: float, alpha: float, theta: float) -> np.ndarray:
     ])
 
 
-def forward_kinematics(joint_angles: list) -> np.ndarray:
-    """
-    Compute forward kinematics for the UR3e.
-    Returns the 4x4 end-effector transformation matrix.
-    """
+def forward_kinematics(joint_angles):
     T = np.eye(4)
     for i, (a, d, alpha, theta_offset) in enumerate(UR3E_DH):
-        theta = joint_angles[i] + theta_offset
-        T = T @ dh_transform(a, d, alpha, theta)
+        T = T @ dh_transform(a, d, alpha, joint_angles[i] + theta_offset)
     return T
 
 
-def clamp(value: float, low: float, high: float) -> float:
+def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def compute_ik(target_x: float, target_y: float, target_z: float,
-               initial_angles: list = None) -> list:
+def compute_ik_single(target_x, target_y, target_z, seed_angles):
     """
-    Compute inverse kinematics using numerical gradient descent.
-
-    Uses the Jacobian pseudoinverse method to iteratively solve
-    for joint angles that place the end-effector at (x, y, z).
-
-    Returns list of 6 joint angles in radians.
+    Run one IK solve from a given seed.
+    Returns (angles, error).
+    Uses position error + small joint angle penalty to prefer natural poses.
     """
-    if initial_angles is None:
-        # UR3e typical working configuration
-        angles = [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]
-    else:
-        angles = list(initial_angles)
-
+    angles = list(seed_angles)
     target = np.array([target_x, target_y, target_z])
 
-    max_iterations = 1000
-    step_size = 0.5
-    tolerance = 0.001      # 1 mm
-    delta = 1e-6           # numerical differentiation step
+    max_iterations = 2000
+    step_size = 0.3
+    tolerance = 0.001
+    delta = 1e-6
+    penalty_weight = 0.01   # small penalty to keep angles near preferred
 
-    for iteration in range(max_iterations):
-        # Current end-effector position
+    for _ in range(max_iterations):
         T = forward_kinematics(angles)
         current_pos = T[:3, 3]
-
         error = target - current_pos
-        error_norm = np.linalg.norm(error)
 
-        if error_norm < tolerance:
+        if np.linalg.norm(error) < tolerance:
             break
 
-        # Build Jacobian numerically
+        # Numerical Jacobian
         J = np.zeros((3, NUM_JOINTS))
         for j in range(NUM_JOINTS):
-            angles_plus = list(angles)
-            angles_plus[j] += delta
-            T_plus = forward_kinematics(angles_plus)
-            J[:, j] = (T_plus[:3, 3] - current_pos) / delta
+            ap = list(angles)
+            ap[j] += delta
+            J[:, j] = (forward_kinematics(ap)[:3, 3] - current_pos) / delta
 
-        # Pseudoinverse step
         J_pinv = np.linalg.pinv(J)
         delta_angles = step_size * J_pinv @ error
 
-        # Update and clamp angles
+        # Add small penalty pulling joints toward preferred angles
         for j in range(NUM_JOINTS):
-            angles[j] += delta_angles[j]
-            low, high = JOINT_LIMITS[j]
-            angles[j] = clamp(angles[j], low, high)
+            delta_angles[j] -= penalty_weight * (angles[j] - PREFERRED_ANGLES[j])
 
-    # Final position check
+        for j in range(NUM_JOINTS):
+            angles[j] = clamp(
+                angles[j] + delta_angles[j],
+                JOINT_LIMITS[j][0],
+                JOINT_LIMITS[j][1]
+            )
+
     T_final = forward_kinematics(angles)
-    final_pos = T_final[:3, 3]
-    final_error = np.linalg.norm(target - final_pos)
-
+    final_error = np.linalg.norm(target - T_final[:3, 3])
     return angles, final_error
 
 
-class CalcIKNode(Node):
+def compute_ik(target_x, target_y, target_z):
     """
-    Computes IK for a UR3e robot and publishes joint angles.
+    Try multiple seeds and return the best solution.
+    Seeds are designed to cover natural arm configurations.
+    """
+    pan = math.atan2(target_y, target_x)
 
-    Compatible with Gazebo and URSim — publishes sensor_msgs/JointState
-    which is the standard interface for both simulators.
-    """
+    seeds = [
+        # Seed 1 — natural elbow up, arm pointing at target
+        [pan, -math.pi / 4,  math.pi / 2, -math.pi / 4, -math.pi / 2, 0.0],
+        # Seed 2 — arm more extended
+        [pan, -math.pi / 6,  math.pi / 3, -math.pi / 6, -math.pi / 2, 0.0],
+        # Seed 3 — arm reaching forward and down
+        [pan, -math.pi / 3,  math.pi / 2, -math.pi / 6, -math.pi / 2, 0.0],
+        # Seed 4 — standard UR home-like position
+        [pan, -math.pi / 2,  math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0],
+        # Seed 5 — slightly offset pan
+        [pan + 0.2, -math.pi / 4, math.pi / 2, -math.pi / 4, -math.pi / 2, 0.0],
+    ]
+
+    best_angles = None
+    best_error = float('inf')
+
+    for seed in seeds:
+        angles, error = compute_ik_single(target_x, target_y, target_z, seed)
+        # Score = position error + penalty for large joint angles
+        joint_penalty = sum(
+            abs(a - p) for a, p in zip(angles, PREFERRED_ANGLES)
+        ) * 0.01
+        score = error + joint_penalty
+
+        if score < best_error:
+            best_error = score
+            best_angles = angles
+
+    # Final true position error for reporting
+    T_final = forward_kinematics(best_angles)
+    true_error = np.linalg.norm(
+        np.array([target_x, target_y, target_z]) - T_final[:3, 3]
+    )
+    return best_angles, true_error
+
+
+class CalcIKNode(Node):
 
     def __init__(self):
         super().__init__('calc_ik_node')
 
-        # ---- parameters ------------------------------------------------
         self.declare_parameter('initial_target_x', 0.3)
         self.declare_parameter('initial_target_y', 0.0)
         self.declare_parameter('initial_target_z', 0.3)
 
-        # ---- subscriptions ---------------------------------------------
         self._target_sub = self.create_subscription(
-            Point,
-            '/ik_target',
-            self._target_callback,
-            qos_profile=10,
-        )
+            Point, '/ik_target', self._target_callback, 10)
 
-        # ---- publications ----------------------------------------------
         self._ik_pub = self.create_publisher(
-            JointState,
-            '/ik_joint_state',
-            qos_profile=10,
-        )
+            JointState, '/ik_joint_state', 10)
         self._target_pub = self.create_publisher(
-            JointState,
-            '/target_joint_state',
-            qos_profile=10,
-        )
+            JointState, '/target_joint_state', 10)
 
-        # ---- compute IK for initial target -----------------------------
         x = self.get_parameter('initial_target_x').get_parameter_value().double_value
         y = self.get_parameter('initial_target_y').get_parameter_value().double_value
         z = self.get_parameter('initial_target_z').get_parameter_value().double_value
@@ -204,12 +214,7 @@ class CalcIKNode(Node):
         )
         self._solve_and_publish(x, y, z)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _solve_and_publish(self, x: float, y: float, z: float) -> None:
-        """Solve IK and publish resulting joint state."""
+    def _solve_and_publish(self, x, y, z):
         self.get_logger().info(
             f'Computing IK for target: x={x:.4f}, y={y:.4f}, z={z:.4f} m'
         )
@@ -218,28 +223,24 @@ class CalcIKNode(Node):
 
         if error > 0.01:
             self.get_logger().warn(
-                f'IK solution may be inaccurate — '
-                f'residual error: {error * 1000:.2f} mm. '
+                f'IK may be inaccurate — residual: {error * 1000:.2f} mm. '
                 f'Target may be out of reach.'
             )
         else:
             self.get_logger().info(
-                f'IK solved successfully — residual error: {error * 1000:.3f} mm'
+                f'IK solved successfully — residual: {error * 1000:.3f} mm'
             )
 
-        # Log the solution
         lines = ['  IK solution (joint angles):']
         for name, angle in zip(JOINT_NAMES, angles):
             lines.append(
-                f'    {name:<25} {angle:+.4f} rad  '
-                f'({math.degrees(angle):+.2f} deg)'
+                f'    {name:<25} {angle:+.4f} rad  ({math.degrees(angle):+.2f} deg)'
             )
         self.get_logger().info('\n'.join(lines))
 
-        # Build and publish JointState message
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_link'   # Gazebo compatible
+        msg.header.frame_id = 'base_link'
         msg.name = JOINT_NAMES
         msg.position = angles
         msg.velocity = [0.0] * NUM_JOINTS
@@ -248,28 +249,16 @@ class CalcIKNode(Node):
         self._ik_pub.publish(msg)
         self._target_pub.publish(msg)
 
-    # ------------------------------------------------------------------
-    # Callback
-    # ------------------------------------------------------------------
-
-    def _target_callback(self, msg: Point) -> None:
-        """Called when a new target position arrives on /ik_target."""
+    def _target_callback(self, msg):
         self.get_logger().info(
-            f'New IK target received: '
-            f'x={msg.x:.4f}, y={msg.y:.4f}, z={msg.z:.4f}'
+            f'New IK target: x={msg.x:.4f}, y={msg.y:.4f}, z={msg.z:.4f}'
         )
         self._solve_and_publish(msg.x, msg.y, msg.z)
 
 
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
-
 def main(args=None):
     rclpy.init(args=args)
-
     node = CalcIKNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

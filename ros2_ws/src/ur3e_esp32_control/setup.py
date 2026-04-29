@@ -24,6 +24,8 @@ setup(
             'joint_state_tracker = ur3e_esp32_control.joint_state_tracker:main',
             'calc_ik_node = ur3e_esp32_control.calc_ik_node:main',
             'instruction_node = ur3e_esp32_control.instruction_node:main',
+            'robot_command_node = ur3e_esp32_control.robot_command_node:main',
+            'direct_control_node = ur3e_esp32_control.direct_control_node:main',
         ],
     },
 )

@@ -2,78 +2,69 @@
 """
 joint_state_tracker.py
 ----------------------
-Maintains the current joint state of the UR3e and increments the
-appropriate joint each time a pushbutton event arrives.
+Maintains the current joint state of the UR3e and increments or
+decrements the appropriate joint each time a pushbutton event arrives.
+
+Button mapping:
+  PB1-PB6        -> increment/decrement joint 1-6 (direction depends on mode)
+  PB7 short (0)  -> toggle forward/reverse direction mode
+  PB7 long  (9)  -> EXECUTE: send all joints to Gazebo simultaneously
 
 Subscriptions
-  /joint_button  (std_msgs/Int32)  — button ID from ESP32
+  /joint_button  (std_msgs/Int32)  - button ID from ESP32
 
 Publications
-  /current_joint_state  (sensor_msgs/JointState)  — live joint angles
-  /target_joint_state   (sensor_msgs/JointState)  — same as current
-                                                     (used by downstream
-                                                      nodes as target)
+  /current_joint_state  (sensor_msgs/JointState)  - live joint angles
+  /execute_motion       (sensor_msgs/JointState)  - triggered on long press PB7
+  /direction_mode       (std_msgs/String)          - current mode
 
-Parameters (settable via ROS 2 param or launch file)
-  joint_step  (float, default 0.1)  — radians added per button press
+Parameters
+  joint_step  (float, default 0.5)  - radians per button press
 """
 
 import math
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 from sensor_msgs.msg import JointState
 
 
-# UR3e joint names in DH / ROS convention order
 JOINT_NAMES = [
-    'shoulder_pan_joint',   # index 0  →  PB1
-    'shoulder_lift_joint',  # index 1  →  PB2
-    'elbow_joint',          # index 2  →  PB3
-    'wrist_1_joint',        # index 3  →  PB4
-    'wrist_2_joint',        # index 4  →  PB5
-    'wrist_3_joint',        # index 5  →  PB6
+    'shoulder_pan_joint',
+    'shoulder_lift_joint',
+    'elbow_joint',
+    'wrist_1_joint',
+    'wrist_2_joint',
+    'wrist_3_joint',
 ]
 
 NUM_JOINTS = len(JOINT_NAMES)
 
-# Joint position limits (radians) — UR3e hardware limits
 JOINT_LIMITS = [
-    (-2 * math.pi, 2 * math.pi),   # shoulder_pan
-    (-2 * math.pi, 2 * math.pi),   # shoulder_lift
-    (-math.pi,     math.pi),        # elbow
-    (-2 * math.pi, 2 * math.pi),   # wrist_1
-    (-2 * math.pi, 2 * math.pi),   # wrist_2
-    (-2 * math.pi, 2 * math.pi),   # wrist_3
+    (-2 * math.pi, 2 * math.pi),
+    (-2 * math.pi, 2 * math.pi),
+    (-math.pi,     math.pi),
+    (-2 * math.pi, 2 * math.pi),
+    (-2 * math.pi, 2 * math.pi),
+    (-2 * math.pi, 2 * math.pi),
 ]
 
 
 def _clamp(value: float, low: float, high: float) -> float:
-    """Clamp value to [low, high]."""
     return max(low, min(high, value))
 
 
 class JointStateTracker(Node):
-    """
-    Tracks UR3e joint positions and increments them on button events.
-
-    Each press of PB{n} adds `joint_step` radians to joint n-1.
-    The updated state is published immediately so downstream nodes
-    (IK node, instruction node, robot command node) can react.
-    """
 
     def __init__(self):
         super().__init__('joint_state_tracker')
 
-        # ---- parameters ------------------------------------------------
-        self.declare_parameter('joint_step', 0.1)   # radians per press
+        self.declare_parameter('joint_step', 0.5)
+        self._positions = [0.0] * NUM_JOINTS
+        self._press_counts = [0] * NUM_JOINTS
+        self._forward_mode = True   # True = forward (+), False = reverse (-)
 
-        # ---- state -----------------------------------------------------
-        self._positions = [0.0] * NUM_JOINTS        # start at home (zeros)
-        self._press_counts = [0] * NUM_JOINTS        # cumulative presses
-
-        # ---- subscriptions ---------------------------------------------
         self._button_sub = self.create_subscription(
             Int32,
             '/joint_button',
@@ -81,88 +72,116 @@ class JointStateTracker(Node):
             qos_profile=10,
         )
 
-        # ---- publications ----------------------------------------------
         self._current_pub = self.create_publisher(
-            JointState,
-            '/current_joint_state',
-            qos_profile=10,
-        )
-        self._target_pub = self.create_publisher(
-            JointState,
-            '/target_joint_state',
-            qos_profile=10,
-        )
+            JointState, '/current_joint_state', qos_profile=10)
 
-        # Publish the initial (all-zero) state so other nodes have
-        # something to read right away.
+        # New publisher — only fires on long press PB7
+        self._execute_pub = self.create_publisher(
+            JointState, '/execute_motion', qos_profile=10)
+
+        self._mode_pub = self.create_publisher(
+            String, '/direction_mode', qos_profile=10)
+
         self._publish_state()
+        self._publish_mode()
 
         self.get_logger().info(
             f'JointStateTracker started — '
-            f'joint_step={self._joint_step():.3f} rad'
+            f'step={self._joint_step():.3f} rad | mode=FORWARD'
         )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        self.get_logger().info(
+            'PB1-PB6: move joints | PB7 short: toggle direction | '
+            'PB7 long (3s): EXECUTE to Gazebo'
+        )
 
     def _joint_step(self) -> float:
         return self.get_parameter('joint_step').get_parameter_value().double_value
 
     def _publish_state(self) -> None:
-        """Build and publish a JointState message on both topics."""
+        """Publishes current joint positions — does NOT trigger Gazebo motion."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = JOINT_NAMES
         msg.position = list(self._positions)
         msg.velocity = [0.0] * NUM_JOINTS
         msg.effort = [0.0] * NUM_JOINTS
-
         self._current_pub.publish(msg)
-        self._target_pub.publish(msg)
+
+    def _publish_execute(self) -> None:
+        """Publishes execute signal — THIS triggers Gazebo motion."""
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = JOINT_NAMES
+        msg.position = list(self._positions)
+        msg.velocity = [0.0] * NUM_JOINTS
+        msg.effort = [0.0] * NUM_JOINTS
+        self._execute_pub.publish(msg)
+
+        # Log the full state being sent
+        lines = ['\n' + '>' * 60]
+        lines.append('  EXECUTE — sending all joints to Gazebo:')
+        lines.append('>' * 60)
+        for i, (name, pos) in enumerate(zip(JOINT_NAMES, self._positions)):
+            lines.append(
+                f'  [{i+1}] {name:<25} {pos:+.4f} rad '
+                f'({math.degrees(pos):+.2f} deg)'
+            )
+        lines.append('>' * 60)
+        self.get_logger().info('\n'.join(lines))
+
+    def _publish_mode(self) -> None:
+        msg = String()
+        msg.data = 'FORWARD' if self._forward_mode else 'REVERSE'
+        self._mode_pub.publish(msg)
 
     def _log_state(self, changed_idx: int) -> None:
-        """Pretty-print the full joint state to the ROS logger."""
         step = self._joint_step()
+        direction = 'FORWARD' if self._forward_mode else 'REVERSE'
         lines = [
-            f'  Joint state after PB{changed_idx + 1} press '
+            f'  [{direction}] Joint state after PB{changed_idx + 1} press '
             f'(step={step:.3f} rad, '
-            f'total presses on this joint: {self._press_counts[changed_idx]}):'
+            f'total presses: {self._press_counts[changed_idx]}):'
         ]
         for i, (name, pos) in enumerate(zip(JOINT_NAMES, self._positions)):
-            marker = ' <-- incremented' if i == changed_idx else ''
+            marker = ' <-- changed' if i == changed_idx else ''
             lines.append(f'    [{i+1}] {name:<25} {pos:+.4f} rad{marker}')
         self.get_logger().info('\n'.join(lines))
 
-    # ------------------------------------------------------------------
-    # Callback
-    # ------------------------------------------------------------------
-
     def _button_callback(self, msg: Int32) -> None:
-        """Increment the joint that corresponds to the pressed button."""
         button_id = msg.data
 
-        # Validate: expect 1–6
-        if button_id < 1 or button_id > NUM_JOINTS:
-            self.get_logger().warn(
-                f'Received out-of-range button value: {button_id}. '
-                f'Expected 1–{NUM_JOINTS}. Ignoring.'
-            )
+        # ── PB7 short press — direction toggle ────────────────────────────────
+        if button_id == 0:
+            self._forward_mode = not self._forward_mode
+            mode_str = 'FORWARD' if self._forward_mode else 'REVERSE'
+            self.get_logger().info(f'Direction toggled -> {mode_str}')
+            self._publish_mode()
             return
 
-        joint_idx = button_id - 1          # convert 1-based to 0-based
+        # ── PB7 long press — EXECUTE all joints to Gazebo ────────────────────
+        if button_id == 9:
+            self.get_logger().info('\n' + '=' * 60)
+            self.get_logger().info('  LONG PRESS PB7 — SENDING COMMAND TO GAZEBO')
+            self.get_logger().info('=' * 60 + '\n')
+            self._publish_execute()
+            return
+
+        # ── PB1-PB6 — update joint positions internally ───────────────────────
+        if button_id < 1 or button_id > NUM_JOINTS:
+            self.get_logger().warn(f'Unknown button value: {button_id}. Ignoring.')
+            return
+
+        joint_idx = button_id - 1
         step = self._joint_step()
 
-        # Increment and clamp
-        new_pos = self._positions[joint_idx] + step
+        delta = step if self._forward_mode else -step
+        new_pos = self._positions[joint_idx] + delta
         low, high = JOINT_LIMITS[joint_idx]
         clamped = _clamp(new_pos, low, high)
 
         if clamped != new_pos:
             self.get_logger().warn(
-                f'Joint {JOINT_NAMES[joint_idx]} hit limit '
-                f'({low:.2f}, {high:.2f}). '
-                f'Clamping {new_pos:.4f} → {clamped:.4f} rad.'
+                f'Joint {JOINT_NAMES[joint_idx]} hit limit. Clamping.'
             )
 
         self._positions[joint_idx] = clamped
@@ -172,15 +191,9 @@ class JointStateTracker(Node):
         self._publish_state()
 
 
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
-
 def main(args=None):
     rclpy.init(args=args)
-
     node = JointStateTracker()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
