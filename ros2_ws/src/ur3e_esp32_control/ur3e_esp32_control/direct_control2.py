@@ -2,9 +2,9 @@
 """
 direct_control_node.py
 ----------------------
-Direct pushbutton control of the UR3e Gazebo simulation.
-Every button press immediately moves the corresponding joint in Gazebo.
-No accumulation, no long press needed.
+Direct pushbutton control of the UR3e Gazebo simulation using
+forward_position_controller — no trajectory planning, no tolerance
+errors, instant joint position updates.
 
 Button mapping:
   PB1 (value=1) -> shoulder_pan_joint
@@ -21,17 +21,16 @@ Subscriptions
   /joint_states  (sensor_msgs/JointState) - Gazebo feedback
 
 Publications
-  /joint_trajectory_controller/joint_trajectory
+  /forward_position_controller/commands  (std_msgs/Float64MultiArray)
   /current_joint_state  (sensor_msgs/JointState)
   /direction_mode       (std_msgs/String)
 
 Parameters
-  joint_step       (float, default 0.1)  - radians per press
-  motion_duration  (float, default 0.1)  - seconds per move
+  joint_step  (float, default 0.05)  - radians per press (~2.8 deg)
 
 Usage
   ros2 run ur3e_esp32_control direct_control_node
-  ros2 run ur3e_esp32_control direct_control_node --ros-args -p joint_step:=0.2
+  ros2 run ur3e_esp32_control direct_control_node --ros-args -p joint_step:=0.1
 """
 
 import math
@@ -39,10 +38,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-from std_msgs.msg import Int32, String
+from std_msgs.msg import Int32, String, Float64MultiArray
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration
 
 
 JOINT_NAMES = [
@@ -65,9 +62,10 @@ JOINT_LIMITS = [
     (-2 * math.pi, 2 * math.pi),
 ]
 
+# Safe home — arm raised up and away from table
 SAFE_HOME = [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
 
-CONTROLLER_TOPIC = "/joint_trajectory_controller/joint_trajectory"
+CONTROLLER_TOPIC = "/forward_position_controller/commands"
 
 
 def clamp(value, low, high):
@@ -80,21 +78,18 @@ class DirectControlNode(Node):
         super().__init__('direct_control_node')
 
         self.declare_parameter('joint_step', 0.1)
-        self.declare_parameter('motion_duration', 0.1)
 
         self.joint_step = (
             self.get_parameter('joint_step').get_parameter_value().double_value
         )
-        self.motion_duration = (
-            self.get_parameter('motion_duration').get_parameter_value().double_value
-        )
 
-        self._positions = [0.0] * NUM_JOINTS
+        self._positions = list(SAFE_HOME)  # start at safe home internally
         self._forward_mode = True
         self._gazebo_synced = False
 
-        self._traj_pub = self.create_publisher(
-            JointTrajectory, CONTROLLER_TOPIC, 10)
+        # Publisher — simple Float64MultiArray, no trajectory planning
+        self._cmd_pub = self.create_publisher(
+            Float64MultiArray, CONTROLLER_TOPIC, 10)
         self._state_pub = self.create_publisher(
             JointState, '/current_joint_state', 10)
         self._mode_pub = self.create_publisher(
@@ -110,12 +105,14 @@ class DirectControlNode(Node):
 
         self.get_logger().info("=" * 60)
         self.get_logger().info("direct_control_node started")
-        self.get_logger().info(f"  Step    : {self.joint_step} rad per press")
-        self.get_logger().info(f"  Duration: {self.motion_duration}s per move")
+        self.get_logger().info(f"  Controller: {CONTROLLER_TOPIC}")
+        self.get_logger().info(f"  Step      : {self.joint_step} rad per press "
+                               f"({math.degrees(self.joint_step):.1f} deg)")
         self.get_logger().info("  Syncing with Gazebo...")
         self.get_logger().info("=" * 60)
 
     def _gazebo_sync_callback(self, msg: JointState):
+        """Sync once from Gazebo on startup then track internally."""
         if self._gazebo_synced:
             return
 
@@ -142,6 +139,7 @@ class DirectControlNode(Node):
     def _button_callback(self, msg: Int32):
         button_id = msg.data
 
+        # PB7 short — direction toggle
         if button_id == 0:
             self._forward_mode = not self._forward_mode
             mode_str = 'FORWARD' if self._forward_mode else 'REVERSE'
@@ -151,6 +149,7 @@ class DirectControlNode(Node):
             self._mode_pub.publish(mode_msg)
             return
 
+        # PB7 long — safe home
         if button_id == 9:
             self.get_logger().info(
                 '\n' + '=' * 60 +
@@ -158,10 +157,11 @@ class DirectControlNode(Node):
                 '\n' + '=' * 60
             )
             self._positions = list(SAFE_HOME)
-            self._send_to_gazebo(duration_sec=3.0)
+            self._send_positions()
             self._publish_state()
             return
 
+        # PB1-PB6 — move joint
         if button_id < 1 or button_id > NUM_JOINTS:
             self.get_logger().warn(f'Unknown button: {button_id}')
             return
@@ -186,30 +186,14 @@ class DirectControlNode(Node):
             f'({math.degrees(clamped):+.2f} deg)'
         )
 
-        self._send_to_gazebo()
+        self._send_positions()
         self._publish_state()
 
-    def _send_to_gazebo(self, duration_sec=None):
-        if duration_sec is None:
-            duration_sec = self.motion_duration
-
-        msg = JointTrajectory()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = JOINT_NAMES
-
-        point = JointTrajectoryPoint()
-        point.positions = list(self._positions)
-        point.velocities = [0.0] * NUM_JOINTS
-        point.accelerations = [0.0] * NUM_JOINTS
-
-        total_ns = int(duration_sec * 1e9)
-        point.time_from_start = Duration(
-            sec=int(duration_sec),
-            nanosec=total_ns % 1_000_000_000,
-        )
-
-        msg.points = [point]
-        self._traj_pub.publish(msg)
+    def _send_positions(self):
+        """Send all joint positions directly — no trajectory, no timing."""
+        msg = Float64MultiArray()
+        msg.data = list(self._positions)
+        self._cmd_pub.publish(msg)
 
     def _publish_state(self):
         msg = JointState()

@@ -33,7 +33,7 @@ class InstructionNode(Node):
     def __init__(self):
         super().__init__('instruction_node')
 
-        self.declare_parameter('joint_step', 0.5)
+        self.declare_parameter('joint_step', 0.1)
         self.declare_parameter('tolerance', 0.25)
 
         self._current_positions = None
